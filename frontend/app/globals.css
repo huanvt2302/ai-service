@@ -1,0 +1,105 @@
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 250 100% 98%;
+    --foreground: 246 47% 20%;
+    --card: 0 0% 100%;
+    --card-foreground: 246 47% 20%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 246 47% 20%;
+    --primary: 239 84% 67%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 234 89% 74%;
+    --secondary-foreground: 246 47% 20%;
+    --cta: 160 84% 39%;
+    --cta-foreground: 210 40% 98%;
+    --muted: 250 50% 92%;
+    --muted-foreground: 246 20% 50%;
+    --accent: 250 50% 92%;
+    --accent-foreground: 246 47% 20%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 250 50% 90%;
+    --input: 250 50% 90%;
+    --ring: 239 84% 67%;
+    --radius: 0.75rem; /* Upgraded radius for a softer look */
+  }
+
+  .dark {
+    --background: 240 5% 4%; /* Deep dark */
+    --foreground: 250 100% 98%;
+    --card: 240 5% 7%; /* Slightly lighter than background */
+    --card-foreground: 250 100% 98%;
+    --popover: 240 5% 7%;
+    --popover-foreground: 250 100% 98%;
+    --primary: 239 84% 67%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 240 5% 12%; /* Elegant muted dark */
+    --secondary-foreground: 250 100% 98%;
+    --cta: 160 84% 39%;
+    --cta-foreground: 210 40% 98%;
+    --muted: 240 5% 12%; 
+    --muted-foreground: 250 20% 65%;
+    --accent: 240 5% 15%;
+    --accent-foreground: 250 100% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 240 5% 15%;
+    --input: 240 5% 15%;
+    --ring: 239 84% 67%;
+  }
+
+  * {
+    @apply border-border;
+  }
+}
+
+body {
+  @apply bg-background text-foreground font-sans antialiased selection:bg-primary/20 selection:text-primary;
+  font-family: 'Fira Sans', sans-serif;
+}
+
+code, pre, .font-mono {
+  font-family: 'Fira Code', monospace;
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { @apply bg-transparent; }
+::-webkit-scrollbar-thumb { @apply bg-muted-foreground/20 rounded-full transition-colors; }
+::-webkit-scrollbar-thumb:hover { @apply bg-muted-foreground/40; }
+
+.shimmer {
+  @apply bg-muted animate-pulse relative overflow-hidden;
+}
+
+/* Animations */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.animate-fade-in { animation: fade-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+.animate-slide-in { animation: slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+
+.delay-100 { animation-delay: 100ms; }
+.delay-200 { animation-delay: 200ms; }
+.delay-300 { animation-delay: 300ms; }
+
+/* Status Badges */
+.badge-active { @apply bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-revoked { @apply bg-red-500/15 text-red-600 dark:text-red-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-expired { @apply bg-amber-500/15 text-amber-600 dark:text-amber-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-pending { @apply bg-blue-500/15 text-blue-600 dark:text-blue-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-done { @apply bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-error { @apply bg-red-500/15 text-red-600 dark:text-red-400 font-medium px-2 py-0.5 rounded-md text-xs; }
+.badge-processing { @apply bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 font-medium px-2 py-0.5 rounded-md text-xs; }
