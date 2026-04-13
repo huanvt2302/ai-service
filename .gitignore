@@ -10,6 +10,7 @@ venv/
 dist/
 build/
 *.so
+site-packages/
 
 ##── Environment ───────────────────────────────────────────────────────────────
 .env
@@ -20,38 +21,78 @@ build/
 node_modules/
 .next/
 out/
+.svelte-kit/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+
+##── TypeScript ────────────────────────────────────────────────────────────────
+*.tsbuildinfo
+next-env.d.ts
 
 ##── Editors ───────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
 
 ##── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
+ehthumbs.db
+desktop.ini
 
 ##── Docker ────────────────────────────────────────────────────────────────────
 *.override.yml
 
 ##── AI / ML ───────────────────────────────────────────────────────────────────
-# HuggingFace model weights (large files — use GCS bucket instead)
+# HuggingFace / llama.cpp model weights (large files — use GCS bucket instead)
 hf_cache/
+models/
 *.bin
 *.safetensors
 *.gguf
+*.pt
+*.pth
+*.onnx
 
 ##── Uploads (use GCS instead of committing) ──────────────────────────────────
 backend/uploads/
 uploads/
 
-##── Misc ──────────────────────────────────────────────────────────────────────
+##── Database / Alembic ────────────────────────────────────────────────────────
+# Keep migrations, ignore local SQLite test DBs
+*.db
+*.sqlite
+*.sqlite3
+
+##── Logs & Runtime ────────────────────────────────────────────────────────────
 *.log
+logs/
+backend/server.log
+
+##── Testing & Coverage ────────────────────────────────────────────────────────
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 coverage/
+htmlcov/
+.coverage
+.coverage.*
+
+##── Monitoring secrets (Grafana provisioning may contain passwords) ───────────
+monitoring/grafana/grafana.db
+monitoring/grafana/plugins/
+
+##── Misc ──────────────────────────────────────────────────────────────────────
+*.pid
+*.seed
+*.tmp
+.cache/

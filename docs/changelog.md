@@ -62,13 +62,7 @@ One paragraph describing what changed and why.
 | 2026-04-11 | [2026-04-11_global_ui_redesign.md](./changelog/2026-04-11_global_ui_redesign.md) | Refactor | Global frontend Flat Design UI rebuild |
 | 2026-04-11 | [2026-04-11_dashboard_promax_redesign.md](./changelog/2026-04-11_dashboard_promax_redesign.md) | Refactor | Dashboard Data-Dense Glassmorphism redesign |
 | 2026-04-11 | [2026-04-11_create_project_overview.md](./changelog/2026-04-11_create_project_overview.md) | Docs | Created project overview document |
-| 2026-04-13 | [2026-04-13_infrastructure_updates.md](./changelog/2026-04-13_infrastructure_updates.md) | Infra/Fix | Hybrid Cloud Burst architecture & macOS Docker vLLM CPU fixes |
-| 2026-04-13 | [2026-04-13_replace_vllm_with_ollama.md](./changelog/2026-04-13_replace_vllm_with_ollama.md) | Refactor | Replaced vLLM with Ollama Docker for macOS ARM64 stability |
-| 2026-04-13 | [2026-04-13_fix_json_decode_error.md](./changelog/2026-04-13_fix_json_decode_error.md) | Fix | Fix JSONDecodeError due to unescaped control chars in payloads |
-| 2026-04-13 | [2026-04-13_fix_gateway_vllm_404.md](./changelog/2026-04-13_fix_gateway_vllm_404.md) | Fix | Handle non-200 vLLM proxy response & JSON decode error |
-| 2026-04-13 | [2026-04-13_update_ollama_model_qwen25_latest.md](./changelog/2026-04-13_update_ollama_model_qwen25_latest.md) | Infra | Update Ollama model from qwen2.5:3b to qwen2.5:latest (7B) |
-| 2026-04-13 | [2026-04-13_update_ollama_model_qwen35_9b.md](./changelog/2026-04-13_update_ollama_model_qwen35_9b.md) | Infra | Switch Ollama to Qwen3.5 9B (official latest, 6.6GB, 256K ctx) |
-| 2026-04-13 | [2026-04-13_replace_ollama_with_llamacpp.md](./changelog/2026-04-13_replace_ollama_with_llamacpp.md) | Refactor | Replace Ollama with llama.cpp server (GGUF, OpenAI-compatible, macOS ARM64) |
+| 2026-04-13 | [2026-04-13_daily.md](./changelog/2026-04-13_daily.md) | Infra/Refactor/Fix/Docs | Daily: Hybrid Burst arch, vLLM→Ollama→llama.cpp migration, JSON fixes, model upgrades, .gitignore |
 
 ---
 
