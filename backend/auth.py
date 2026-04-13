@@ -77,20 +77,31 @@ def decode_token(token: str) -> dict:
 # ── Rate limiting (Redis sliding window) ──────────────────────────────
 
 def check_rate_limit(api_key_id: str, limit: int = 100, window_seconds: int = 60) -> bool:
-    """Returns True if request is allowed, False if rate limited."""
-    r = get_redis()
-    key = f"rate:{api_key_id}"
-    now = datetime.now(timezone.utc).timestamp()
-    window_start = now - window_seconds
+    """Returns True if request is allowed, False if rate limited.
+    
+    If Redis is unavailable, allow the request (graceful degradation).
+    """
+    try:
+        r = get_redis()
+        key = f"rate:{api_key_id}"
+        now = datetime.now(timezone.utc).timestamp()
+        window_start = now - window_seconds
 
-    pipe = r.pipeline()
-    pipe.zremrangebyscore(key, 0, window_start)
-    pipe.zadd(key, {str(now): now})
-    pipe.zcard(key)
-    pipe.expire(key, window_seconds + 5)
-    results = pipe.execute()
-    count = results[2]
-    return count <= limit
+        pipe = r.pipeline()
+        pipe.zremrangebyscore(key, 0, window_start)
+        pipe.zadd(key, {str(now): now})
+        pipe.zcard(key)
+        pipe.expire(key, window_seconds + 5)
+        results = pipe.execute()
+        count = results[2]
+        return count <= limit
+    except Exception as e:
+        # If Redis fails, allow the request through (fail open)
+        # Log the error for monitoring
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Rate limit check failed for key {api_key_id}: {e}")
+        return True
 
 
 # ── Auth dependencies ─────────────────────────────────────────────────
@@ -119,31 +130,49 @@ def get_current_team_from_api_key(
     db: Session = Depends(get_db),
 ):
     """Validates x-api-key header for external gateway calls."""
-    api_key_value = request.headers.get("x-api-key") or request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not api_key_value:
-        raise HTTPException(status_code=401, detail="API key required")
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    try:
+        api_key_value = request.headers.get("x-api-key") or request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not api_key_value:
+            raise HTTPException(status_code=401, detail="API key required")
 
-    key_hash = hash_api_key(api_key_value)
-    api_key = db.query(ApiKey).filter(
-        ApiKey.key_hash == key_hash,
-        ApiKey.status == ApiKeyStatus.active,
-    ).first()
+        key_hash = hash_api_key(api_key_value)
+        api_key = db.query(ApiKey).filter(
+            ApiKey.key_hash == key_hash,
+            ApiKey.status == ApiKeyStatus.active,
+        ).first()
 
-    if not api_key:
-        raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+        if not api_key:
+            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
-    # Check expiry
-    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
-        api_key.status = ApiKeyStatus.expired
-        db.commit()
-        raise HTTPException(status_code=401, detail="API key expired")
+        # Check expiry
+        if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+            try:
+                api_key.status = ApiKeyStatus.expired
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to mark API key as expired: {e}")
+                db.rollback()
+            raise HTTPException(status_code=401, detail="API key expired")
 
-    # Rate limit check
-    if not check_rate_limit(str(api_key.id)):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        # Rate limit check (fails gracefully if Redis is down)
+        if not check_rate_limit(str(api_key.id)):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    # Update last_used
-    api_key.last_used_at = datetime.now(timezone.utc)
-    db.commit()
+        # Update last_used timestamp
+        try:
+            api_key.last_used_at = datetime.now(timezone.utc)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to update API key last_used timestamp: {e}")
+            db.rollback()
 
-    return api_key
+        return api_key
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in API key authentication: {e}")
+        raise HTTPException(status_code=500, detail="Authentication service temporarily unavailable")

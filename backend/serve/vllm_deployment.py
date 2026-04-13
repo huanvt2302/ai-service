@@ -69,7 +69,14 @@ class EmbeddingDeployment:
         print(f"[EmbeddingDeployment] Loaded model, dim={self.dim}")
 
     async def __call__(self, request):
-        body = await request.json()
+        try:
+            import json
+            raw_body = await request.body()
+            body = json.loads(raw_body.decode("utf-8", errors="replace"), strict=False)
+        except Exception as e:
+            from starlette.responses import JSONResponse
+            return JSONResponse({"error": f"Invalid JSON payload: {e}"}, status_code=400)
+            
         texts = body.get("input", [])
         if isinstance(texts, str):
             texts = [texts]

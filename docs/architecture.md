@@ -88,11 +88,11 @@
                                    │  │    on configured model           │    │
                                    │  └──────────────────────────────────┘    │
                                    │                                          │
-                                   │  vLLM Server (port 8000)                 │
-                                   │   model: Qwen/Qwen2.5-3B-Instruct        │
-                                   │   served as: qwen3.5-plus                │
-                                   │   device: cpu (default) / cuda           │
-                                   └──────────────────────────────────────────┘
+                                   │  llama.cpp Server (port 8080, host :11434)       │
+                                   │   image: ghcr.io/ggerganov/llama.cpp:server       │
+                                   │   model: Qwen2.5-3B-Instruct-Q4_K_M.gguf         │
+                                   │   served as: qwen3.5-plus (CPU / macOS ARM64)     │
+                                   └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -108,7 +108,8 @@
 | `frontend` | Next.js 14 / TypeScript | 3000 | Console UI | Workers |
 | `backend` | Python / FastAPI | 8080 | API Gateway + business logic | Workers (×4) |
 | `worker` | Python / RQ | — | Document ingestion background jobs | Workers (×4) |
-| `vllm` | vllm/vllm-openai | 8000 | LLM serving (qwen3.5-plus) | GPU Workers (×2) |
+| `model-downloader` | Python / huggingface_hub | — | Init container: download GGUF model on first start | Workers |
+| `llama-cpp` | ghcr.io/ggerganov/llama.cpp | 11434→8080 | LLM serving — OpenAI-compatible (llama.cpp server) | Workers |
 | `postgres` | pgvector/pgvector:pg16 | 5432 | Relational DB + vector store | Manager |
 | `redis` | redis:7-alpine | 6379 | Rate limiting + task queue + cache | Manager |
 | `node-exporter` | prom/node-exporter | 9100 | Host CPU/memory metrics (global) | All Nodes |
@@ -280,7 +281,8 @@ For **local development** only. Use `docker-compose.yml` with `docker compose up
                     └─► redis:6379                                  │
   worker ──────────────► redis:6379 ◄── RQ jobs                    │
                          postgres:5432                              │
-  vllm ◄─── backend ───► :8000                                     │
+  llama-cpp ◄─ backend ──► :8080 (host :11434, alias qwen3.5-plus)   │
+  model-downloader ──────► models_data volume (init, runs once)       │
   prometheus ──────────► backend:8080/metrics                      │
   grafana ─────────────► prometheus:9090                           │
                     └────────────────────────────────────────-─────┘

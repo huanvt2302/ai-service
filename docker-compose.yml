@@ -4,7 +4,7 @@ x-common-env: &common-env
   DATABASE_URL: "postgresql://aiplatform:aiplatform@postgres:5432/aiplatform"
   REDIS_URL: "redis://redis:6379"
   RAY_ADDRESS: "ray://ray:10001"
-  VLLM_BASE_URL: "http://vllm:8000"
+  VLLM_BASE_URL: "http://llama-cpp:8080/v1"
 
 services:
   # ── PostgreSQL + pgvector ────────────────────────────────────────────────
@@ -22,7 +22,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aiplatform"]
+      test: [ "CMD-SHELL", "pg_isready -U aiplatform" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -38,7 +38,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,55 +49,71 @@ services:
     container_name: ai_ray
     restart: unless-stopped
     command: >
-      ray start --head
-      --dashboard-host=0.0.0.0
-      --port=6380
-      --ray-client-server-port=10001
-      --object-manager-port=8076
-      --node-manager-port=8077
-      --block
+      ray start --head --dashboard-host=0.0.0.0 --port=6380 --ray-client-server-port=10001 --object-manager-port=8076 --node-manager-port=8077 --block
     environment:
       RAY_DISABLE_MEMORY_MONITOR: "1"
     ports:
-      - "8265:8265"   # Ray Dashboard
+      - "8265:8265" # Ray Dashboard
       - "10001:10001" # Ray client
-      - "6380:6380"   # Ray Redis
+      - "6380:6380" # Ray Redis
     shm_size: "2gb"
     volumes:
       - ./backend/serve:/app/serve
     healthcheck:
-      test: ["CMD-SHELL", "ray status || exit 1"]
+      test: [ "CMD-SHELL", "ray status || exit 1" ]
       interval: 30s
       timeout: 10s
       retries: 5
 
-  # ── vLLM Server (CPU fallback if no GPU) ────────────────────────────────
-  vllm:
-    image: vllm/vllm-openai:latest
-    container_name: ai_vllm
-    restart: unless-stopped
-    command: >
-      --model Qwen/Qwen2.5-3B-Instruct
-      --served-model-name qwen3.5-plus
-      --host 0.0.0.0
-      --port 8000
-      --device cpu
-      --dtype float32
-      --max-model-len 4096
-    ports:
-      - "8000:8000"
+  # ── Model Downloader (init — pulls GGUF if not cached) ─────────────────
+  model-downloader:
+    image: python:3.11-slim
+    container_name: ai_model_downloader
+    restart: "no"
     volumes:
-      - hf_cache:/root/.cache/huggingface
+      - models_data:/models
+      - ./scripts/download_model.py:/app/download_model.py:ro
     environment:
-      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    profiles: ["vllm"]  # optional: start with --profile vllm
+      HF_TOKEN: "${HF_TOKEN:-}"
+      LLAMA_CPP_MODEL: "${LLAMA_CPP_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+      HF_REPO_ID: "${HF_REPO_ID:-Qwen/Qwen2.5-3B-Instruct-GGUF}"
+    command: [ "python", "/app/download_model.py" ]
+
+  # ── llama.cpp Server — OpenAI-compatible inference (CPU / macOS ARM64) ──
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: ai_llama_cpp
+    restart: unless-stopped
+    ports:
+      - "11434:8080"
+    volumes:
+      - models_data:/models
+    environment:
+      LLAMA_CPP_MODEL: "${LLAMA_CPP_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+    command:
+      - "--model"
+      - "/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+      - "--alias"
+      - "qwen3.5-plus"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--ctx-size"
+      - "8192"
+      - "--threads"
+      - "4"
+      - "--parallel"
+      - "2"
+    depends_on:
+      model-downloader:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   # ── FastAPI Backend ──────────────────────────────────────────────────────
   backend:
@@ -111,8 +127,8 @@ services:
       JWT_SECRET: "${JWT_SECRET:-super-secret-jwt-key-change-in-prod}"
       JWT_ALGORITHM: "HS256"
       JWT_EXPIRE_MINUTES: "60"
-      VLLM_BASE_URL: "${VLLM_BASE_URL:-http://vllm:8000}"
-      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://vllm:8000}"
+      VLLM_BASE_URL: "${VLLM_BASE_URL:-http://llama-cpp:8080/v1}"
+      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://llama-cpp:8080/v1}"
       ALLOWED_ORIGINS: "http://localhost:3000,http://frontend:3000"
     ports:
       - "8080:8080"
@@ -199,7 +215,8 @@ volumes:
   prometheus_data:
   grafana_data:
   upload_data:
-  hf_cache:
+  models_data:
+
 
 networks:
   default:
