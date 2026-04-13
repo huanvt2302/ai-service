@@ -304,7 +304,8 @@ ai-service/
 |---|---|
 | [Architecture](./docs/architecture.md) | High-level diagrams, service inventory, hybrid topology |
 | [System Design](./docs/system-design.md) | Component rules, scaling strategy, failure handling |
-| [Setup Guide](./docs/setup-server.md) | Step-by-step server setup (Swarm + GCP Cloud Burst) |
+| [Setup — Mac (single machine)](./docs/setup-server-mac.md) | Run locally on 1 Mac with docker compose |
+| [Setup — Linux Swarm + GCP](./docs/setup-server.md) | Production 3-machine Swarm + GCP Cloud Burst |
 | [API Spec](./docs/api-spec.md) | All endpoints with request/response examples |
 | [Changelog](./docs/changelog.md) | Per-task change history |
 | [Roadmap](./docs/roadmap.md) | Planned features by version |
