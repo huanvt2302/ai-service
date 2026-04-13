@@ -62,6 +62,7 @@ One paragraph describing what changed and why.
 | 2026-04-11 | [2026-04-11_global_ui_redesign.md](./changelog/2026-04-11_global_ui_redesign.md) | Refactor | Global frontend Flat Design UI rebuild |
 | 2026-04-11 | [2026-04-11_dashboard_promax_redesign.md](./changelog/2026-04-11_dashboard_promax_redesign.md) | Refactor | Dashboard Data-Dense Glassmorphism redesign |
 | 2026-04-11 | [2026-04-11_create_project_overview.md](./changelog/2026-04-11_create_project_overview.md) | Docs | Created project overview document |
+| 2026-04-13 | [2026-04-13_hybrid_cloud_burst_architecture.md](./changelog/2026-04-13_hybrid_cloud_burst_architecture.md) | Infrastructure | Hybrid Local-First + GCP Cloud Run burst layer (Docker Swarm, Hybrid Router, Burst Controller) |
 
 ---
 

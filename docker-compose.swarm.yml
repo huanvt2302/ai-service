@@ -1,0 +1,365 @@
+version: "3.9"
+
+# ── Shared environment anchors ─────────────────────────────────────────────────
+x-db-env: &db-env
+  DATABASE_URL: "postgresql://aiplatform:${DB_PASSWORD:?DB_PASSWORD required}@postgres:5432/aiplatform"
+
+x-redis-env: &redis-env
+  REDIS_URL: "redis://redis:6379"
+
+x-common-env: &common-env
+  <<: *db-env
+  <<: *redis-env
+
+# ── Logging default ────────────────────────────────────────────────────────────
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+# ==============================================================================
+# SERVICES
+# ==============================================================================
+services:
+
+  # ── Hybrid Router ─────────────────────────────────────────────────────────────
+  # Sits in front of everything. Routes LOCAL or CLOUD based on CPU.
+  hybrid-router:
+    image: ${REGISTRY:-localhost:5000}/hybrid-router:${TAG:-latest}
+    ports:
+      - target: 8888
+        published: 80
+        protocol: tcp
+        mode: host   # host mode for lowest latency on entry point
+    environment:
+      PROMETHEUS_URL:      "http://prometheus:9090"
+      LOCAL_BACKEND_URL:   "http://backend:8080"
+      CLOUD_BACKEND_URL:   "${CLOUD_BACKEND_URL:-}"           # empty = cloud disabled
+      BURST_THRESHOLD:     "${BURST_THRESHOLD:-70}"
+      CPU_CACHE_TTL:       "10"
+      CIRCUIT_BREAKER_MAX: "3"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      update_config:
+        parallelism: 1
+        delay: 5s
+        failure_action: rollback
+      labels:
+        - "traefik.enable=false"
+
+  # ── Burst Controller ──────────────────────────────────────────────────────────
+  # Daemon that watches Prometheus CPU and calls gcloud to scale Cloud Run.
+  burst-controller:
+    image: ${REGISTRY:-localhost:5000}/burst-controller:${TAG:-latest}
+    environment:
+      PROMETHEUS_URL:       "http://prometheus:9090"
+      GCP_PROJECT:          "${GCP_PROJECT:-}"
+      GCP_REGION:           "${GCP_REGION:-asia-southeast1}"
+      CLOUD_RUN_SERVICES:   "${CLOUD_RUN_SERVICES:-ai-backend,ai-vllm}"
+      BURST_THRESHOLD:      "${BURST_THRESHOLD:-70}"
+      SCALE_DOWN_THRESHOLD: "${SCALE_DOWN_THRESHOLD:-40}"
+      BURST_MIN_INSTANCES:  "${BURST_MIN_INSTANCES:-2}"
+      POLL_INTERVAL:        "10"
+      BURST_CONFIRM_SECS:   "30"
+      SCALE_DOWN_SECS:      "60"
+    volumes:
+      # Mount host's gcloud credentials (obtained via `gcloud auth` or SA JSON)
+      - /root/.config/gcloud:/root/.config/gcloud:ro
+      # Optional: mount Service Account JSON key instead
+      # - ${GCP_SA_KEY_PATH:-/dev/null}:/sa/key.json:ro
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+  # ── FastAPI Backend (stateless workers) ───────────────────────────────────────
+  backend:
+    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
+    environment:
+      <<: *common-env
+      JWT_SECRET:         "${JWT_SECRET:?JWT_SECRET required}"
+      JWT_ALGORITHM:      "HS256"
+      JWT_EXPIRE_MINUTES: "60"
+      VLLM_BASE_URL:      "http://vllm:8000"
+      EMBEDDING_BASE_URL: "http://vllm:8000"
+      ALLOWED_ORIGINS:    "${ALLOWED_ORIGINS:-http://localhost:80}"
+      GCS_BUCKET:         "${GCS_BUCKET:-}"    # for file uploads
+    command: >
+      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8080"
+    volumes:
+      - upload_data:/app/uploads    # local fallback; prefer GCS via env
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 4                   # 2 per worker node by default
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 2
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus:   "2"
+          memory: "2G"
+        reservations:
+          cpus:   "0.5"
+          memory: "512M"
+
+  # ── RQ Document Worker ────────────────────────────────────────────────────────
+  worker:
+    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
+    environment:
+      <<: *common-env
+      VLLM_BASE_URL:  "http://vllm:8000"
+      GCS_BUCKET:     "${GCS_BUCKET:-}"
+    command: >
+      rq worker --with-scheduler --url redis://redis:6379 document_queue
+    volumes:
+      - upload_data:/app/uploads
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 4
+      placement:
+        constraints:
+          - node.role == worker
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      resources:
+        limits:
+          cpus:   "1"
+          memory: "1G"
+
+  # ── vLLM Inference Server (GPU) ───────────────────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-3B-Instruct}
+      --served-model-name ${VLLM_SERVED_NAME:-qwen3.5-plus}
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len ${VLLM_MAX_LEN:-4096}
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 2                   # 1 per GPU worker node
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.gpu == "true"
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          cpus:   "6"
+          memory: "20G"
+        # NOTE: GPU resources in Swarm require the nvidia plugin.
+        # Uncomment if nvidia-container-runtime is installed:
+        # generic_resources:
+        #   - discrete_resource_spec:
+        #       kind: "NVIDIA-GPU"
+        #       value: 1
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    image: ${REGISTRY:-localhost:5000}/frontend:${TAG:-latest}
+    environment:
+      NEXT_PUBLIC_API_URL: "http://${MACHINE1_IP:-localhost}:80"
+      NEXTAUTH_SECRET:     "${NEXTAUTH_SECRET:?NEXTAUTH_SECRET required}"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 5s
+      resources:
+        limits:
+          cpus:   "1"
+          memory: "512M"
+
+  # ── PostgreSQL + pgvector ─────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER:     aiplatform
+      POSTGRES_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD required}"
+      POSTGRES_DB:       aiplatform
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+          - node.labels.pg == "primary"   # pin to manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          cpus:   "2"
+          memory: "4G"
+
+  # ── Redis ─────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      resources:
+        limits:
+          cpus:   "0.5"
+          memory: "600M"
+
+  # ── node-exporter (global — runs on EVERY Swarm node) ────────────────────────
+  # Exposes host CPU, memory, disk metrics to Prometheus.
+  # Required for Hybrid Router + Burst Controller to work.
+  node-exporter:
+    image: prom/node-exporter:latest
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      mode: global   # ← runs on EVERY node automatically
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus:   "0.1"
+          memory: "64M"
+
+  # ── Prometheus ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus:   "0.5"
+          memory: "512M"
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP:    "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus:   "0.5"
+          memory: "256M"
+
+# ==============================================================================
+# VOLUMES
+# ==============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  upload_data:
+    driver: local
+  hf_cache:
+    driver: local
+
+# ==============================================================================
+# NETWORKS
+# ==============================================================================
+networks:
+  ai_swarm_net:
+    driver: overlay
+    attachable: true     # allows manual `docker run --network ai_swarm_net` for debugging
+    name: ai_swarm_net

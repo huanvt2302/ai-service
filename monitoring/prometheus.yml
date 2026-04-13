@@ -1,22 +1,58 @@
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  scrape_interval:     10s   # reduced from 15s for faster burst detection
+  evaluation_interval: 10s
+
+# ── Alerting ──────────────────────────────────────────────────────────────────
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
 
 scrape_configs:
+
+  # ── Hybrid Router self-metrics ───────────────────────────────────────────────
+  - job_name: "hybrid-router"
+    static_configs:
+      - targets: ["hybrid-router:8888"]
+    metrics_path: "/router/metrics"
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
   - job_name: "ai-platform-backend"
     static_configs:
       - targets: ["backend:8080"]
     metrics_path: "/metrics"
 
-  - job_name: "ray-serve"
+  # ── node-exporter (runs on every Swarm node in global mode) ─────────────────
+  # These targets expose host-level CPU, memory, disk, network.
+  # The Hybrid Router and Burst Controller query the aggregate avg CPU here.
+  #
+  # UPDATE THESE IPs to match your actual machine IPs.
+  - job_name: "node-exporter"
     static_configs:
-      - targets: ["ray:8265"]
-    metrics_path: "/metrics"
+      - targets:
+          - "${MACHINE1_IP:-machine1}:9100"   # Manager node
+          - "${MACHINE2_IP:-machine2}:9100"   # Worker node (GPU)
+          - "${MACHINE3_IP:-machine3}:9100"   # Worker node (GPU)
+        labels:
+          cluster: "local-swarm"
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: instance
+        replacement: "$1"
 
+  # ── Redis exporter ───────────────────────────────────────────────────────────
   - job_name: "redis"
     static_configs:
       - targets: ["redis:9121"]
 
+  # ── PostgreSQL exporter ──────────────────────────────────────────────────────
   - job_name: "postgres"
     static_configs:
       - targets: ["postgres:9187"]
+
+  # ── vLLM inference server ────────────────────────────────────────────────────
+  - job_name: "vllm"
+    static_configs:
+      - targets: ["vllm:8000"]
+    metrics_path: "/metrics"

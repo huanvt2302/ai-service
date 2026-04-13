@@ -1,7 +1,57 @@
-node_modules
+##── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.Python
+*.egg-info/
+dist/
+build/
+*.so
+
+##── Environment ───────────────────────────────────────────────────────────────
 .env
-__pycache__
-.venv
-.vscode
-.idea
+.env.*
+!.env.example
+
+##── Node / Next.js ────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+##── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+##── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+
+##── Docker ────────────────────────────────────────────────────────────────────
+*.override.yml
+
+##── AI / ML ───────────────────────────────────────────────────────────────────
+# HuggingFace model weights (large files — use GCS bucket instead)
+hf_cache/
+*.bin
+*.safetensors
+*.gguf
+
+##── Uploads (use GCS instead of committing) ──────────────────────────────────
+backend/uploads/
+uploads/
+
+##── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/

@@ -1,7 +1,7 @@
 # Architecture — NeuralAPI AI Platform
 
-**Version:** 1.0.0  
-**Last Updated:** 2026-04-10  
+**Version:** 1.1.0  
+**Last Updated:** 2026-04-13  
 **Status:** Active
 
 ---
@@ -99,17 +99,28 @@
 
 ## 2. Services Inventory
 
-| Service | Language | Port | Role |
+### Local Cluster Services (Docker Swarm)
+
+| Service | Language | Port | Role | Placement |
+|---|---|---|---|---|
+| `hybrid-router` | Python / FastAPI | 80 | CPU-based request router (local ↔ cloud) | Manager |
+| `burst-controller` | Python / asyncio | — | GCP Cloud Run auto-scaler daemon | Manager |
+| `frontend` | Next.js 14 / TypeScript | 3000 | Console UI | Workers |
+| `backend` | Python / FastAPI | 8080 | API Gateway + business logic | Workers (×4) |
+| `worker` | Python / RQ | — | Document ingestion background jobs | Workers (×4) |
+| `vllm` | vllm/vllm-openai | 8000 | LLM serving (qwen3.5-plus) | GPU Workers (×2) |
+| `postgres` | pgvector/pgvector:pg16 | 5432 | Relational DB + vector store | Manager |
+| `redis` | redis:7-alpine | 6379 | Rate limiting + task queue + cache | Manager |
+| `node-exporter` | prom/node-exporter | 9100 | Host CPU/memory metrics (global) | All Nodes |
+| `prometheus` | prom/prometheus | 9090 | Metrics collection | Manager |
+| `grafana` | grafana/grafana | 3001 | Metrics visualization | Manager |
+
+### GCP Cloud Run Services (Burst Layer)
+
+| Service | Runtime | min→max | Role |
 |---|---|---|---|
-| `frontend` | Next.js 14 / TypeScript | 3000 | Console UI |
-| `backend` | Python / FastAPI | 8080 | API Gateway + business logic |
-| `worker` | Python / RQ | — | Document ingestion background jobs |
-| `postgres` | pgvector/pgvector:pg16 | 5432 | Relational DB + vector store |
-| `redis` | redis:7-alpine | 6379 | Rate limiting + task queue + cache |
-| `ray` | rayproject/ray:2.9.0 | 8265, 10001 | Ray cluster head node |
-| `vllm` | vllm/vllm-openai | 8000 | LLM serving (qwen3.5-plus) |
-| `prometheus` | prom/prometheus | 9090 | Metrics collection |
-| `grafana` | grafana/grafana | 3001 | Metrics visualization |
+| `ai-backend` | Python / FastAPI | 0→20 | Overflow API Gateway when local CPU ≥ threshold |
+| `ai-vllm` | vllm-openai / NVIDIA L4 | 0→20 | Overflow LLM inference when local CPU ≥ threshold |
 
 ---
 
@@ -258,7 +269,9 @@ Quota blocking happens **before** the LLM call. Usage recording happens **after*
 
 ---
 
-## 9. Deployment Topology
+## 9. Deployment Topology — Single Node (docker-compose)
+
+For **local development** only. Use `docker-compose.yml` with `docker compose up`.
 
 ```
                     ┌── docker-compose network: ai_platform_net ──┐
@@ -267,9 +280,93 @@ Quota blocking happens **before** the LLM call. Usage recording happens **after*
                     └─► redis:6379                                  │
   worker ──────────────► redis:6379 ◄── RQ jobs                    │
                          postgres:5432                              │
-  ray ─────────────────► :8265 (dashboard)                         │
   vllm ◄─── backend ───► :8000                                     │
   prometheus ──────────► backend:8080/metrics                      │
   grafana ─────────────► prometheus:9090                           │
                     └────────────────────────────────────────-─────┘
 ```
+
+---
+
+## 10. Hybrid Deployment Topology — Local Swarm + GCP Cloud Burst
+
+For **production**. Uses `docker-compose.swarm.yml` with Docker Swarm across 3 machines.
+Overflow traffic automatically routes to GCP Cloud Run when local CPU ≥ threshold.
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║                    INTERNET / CLIENTS                                 ║
+╚════════════════════╤═════════════════════════════════════════════════╝
+                     │ :80
+                     ▼
+╔══════════════════════════════════════════════════════════════════════╗
+║         HYBRID ROUTER  (Machine 1 — Swarm Manager)                   ║
+║                                                                       ║
+║  ┌───────────────────────────────────────────────────────────────┐   ║
+║  │ FastAPI Reverse Proxy                                         │   ║
+║  │                                                               │   ║
+║  │  Every 10s: avg_cpu = Prometheus query across 3 nodes        │   ║
+║  │                                                               │   ║
+║  │  avg_cpu < 70%  →  proxy → LOCAL backend (Swarm VIP :8080)  │   ║
+║  │  avg_cpu ≥ 70%  →  proxy → CLOUD (GCP Cloud Run URL)        │   ║
+║  │  3 local errors →  circuit-breaker → CLOUD                  │   ║
+║  └───────────────────────────────────────────────────────────────┘   ║
+╚══════════════╤══════════════════════════════════════╤════════════════╝
+               │ LOCAL PATH (CPU < 70%)               │ BURST PATH (CPU ≥ 70%)
+               ▼                                      ▼
+╔══════════════════════════════╗   ╔════════════════════════════════════╗
+║  LOCAL SWARM CLUSTER          ║   ║  GCP CLOUD RUN (Burst Layer)       ║
+║                               ║   ║                                    ║
+║  Machine 1 (Manager):         ║   ║  ai-backend                        ║
+║  ├ postgres (primary)         ║   ║  min=0  max=20  CPU=2  RAM=2Gi    ║
+║  ├ redis                      ║   ║                                    ║
+║  ├ prometheus                 ║   ║  ai-vllm (NVIDIA L4 GPU)           ║
+║  └ grafana                    ║   ║  min=0  max=20  CPU=4  RAM=16Gi   ║
+║                               ║   ║                                    ║
+║  Machine 2 (GPU Worker):      ║   ║  Shared Cloud SQL (pgvector)       ║
+║  ├ backend ×2                 ║   ║  Shared Memorystore Redis          ║
+║  ├ vllm (GPU)                 ║   ║  GCS file uploads                  ║
+║  └ node-exporter              ║   ╚════════════════════════════════════╝
+║                               ║              ▲
+║  Machine 3 (GPU Worker):      ║              │ gcloud run services update
+║  ├ backend ×2                 ║   ╔══════════╧═════════════════════════╗
+║  ├ vllm (GPU)                 ║   ║  BURST CONTROLLER (Machine 1)      ║
+║  ├ rq-worker ×4               ║   ║                                    ║
+║  └ node-exporter              ║   ║  Poll Prometheus CPU every 10s    ║
+║                               ║   ║  CPU > 70% for 30s → scale UP     ║
+║  [node-exporter global:       ║   ║    min-instances = 2               ║
+║   all machines → :9100]       ║   ║  CPU < 40% for 60s → scale DOWN   ║
+╚══════════════════════════════╝   ║    min-instances = 0               ║
+                                   ╚════════════════════════════════════╝
+```
+
+### Burst Decision Logic
+
+```
+CPU Timeline:
+
+  30% ──────────────────┐                        ┌──────────── 30%
+                        │ rises                  │ falls
+  70% ─────────────────-┼──────────────────────--┼──────────── 70% (BURST_THRESHOLD)
+                        │ [30s confirm]           │
+                        └──────────── 85% ───────┘
+                               BURSTING
+
+Actions:
+  CPU > 70% for 30s  →  BurstController: set min-instances=2
+                      →  HybridRouter: new requests → Cloud Run
+  CPU < 40% for 60s  →  BurstController: set min-instances=0
+                      →  HybridRouter: new requests → Local
+```
+
+### Key Files
+
+| File | Purpose |
+|---|---|
+| `docker-compose.swarm.yml` | Swarm stack (production) |
+| `docker-compose.yml` | Single-node dev stack |
+| `hybrid-router/main.py` | Routing logic + circuit breaker |
+| `burst-controller/controller.py` | GCP Cloud Run auto-scaler |
+| `scripts/setup-swarm.sh` | Cluster bootstrap script |
+| `scripts/burst-gcp.sh` | GCP infrastructure + Cloud Run deploy |
+| `monitoring/prometheus.yml` | Scrape configs (node-exporter on all nodes) |

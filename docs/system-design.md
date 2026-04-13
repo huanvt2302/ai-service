@@ -1,7 +1,7 @@
 # System Design — NeuralAPI AI Platform
 
-**Version:** 1.0.0  
-**Last Updated:** 2026-04-10  
+**Version:** 1.1.0  
+**Last Updated:** 2026-04-13  
 **Status:** Active
 
 ---
@@ -120,30 +120,63 @@ Pipeline per document:
 
 ---
 
-### 1.6 Ray Serve
+### 1.6 Hybrid Router (`hybrid-router/main.py`)
 
-Two named deployments started via `backend/serve/vllm_deployment.py`:
+| Responsibility | Detail |
+|---|---|
+| CPU metric fetch | Queries Prometheus `node_cpu_seconds_total` across all Swarm nodes; cached 10s |
+| Routing decision | `avg_cpu < BURST_THRESHOLD` → local; `>= threshold` → Cloud Run |
+| Circuit breaker | 3 consecutive local errors → force Cloud Run; reset on next local success |
+| Self-metrics | Emits `hybrid_router_requests_total`, `hybrid_router_local_cpu_percent` to Prometheus |
+| Status endpoint | `GET /router/status` — current mode, CPU %, error count |
+| Reset endpoint | `POST /router/reset` — manually reopen circuit breaker |
 
-| Deployment | route_prefix | Backing | Replicas |
-|---|---|---|---|
-| `vllm` | `/v1` | vLLM OpenAI server at `:8000` | 1–4 (autoscale) |
-| `embeddings` | `/embeddings` | sentence-transformers in-process | 1 (fixed) |
+**Routing rules (in priority order):**
+1. If `CLOUD_BACKEND_URL` is empty → always route local (cloud disabled)
+2. If circuit breaker is open (>= 3 local errors) → route cloud
+3. If `avg_cpu >= BURST_THRESHOLD` → route cloud
+4. Otherwise → route local
 
-Autoscaling trigger: `target_num_ongoing_requests_per_replica = 10`
+### 1.7 Burst Controller (`burst-controller/controller.py`)
+
+| Responsibility | Detail |
+|---|---|
+| Polling | Prometheus query every `POLL_INTERVAL` seconds (default 10s) |
+| Scale UP trigger | CPU >= `BURST_THRESHOLD` for `BURST_CONFIRM_SECS` (30s) → set `min-instances=2` |
+| Scale DOWN trigger | CPU < `SCALE_DOWN_THRESHOLD` (40%) for `SCALE_DOWN_SECS` (60s) → set `min-instances=0` |
+| GCP action | Calls `gcloud run services update --min-instances=N` for each service in `CLOUD_RUN_SERVICES` |
+| Fail-safe | If Prometheus unreachable → returns CPU=0 → no burst triggered |
+
+**Hysteresis design** (prevents flapping):
+- Burst threshold: 70% CPU
+- Scale-down threshold: 40% CPU (lower than burst to avoid oscillation)
+- Confirmation timers prevent reacting to momentary spikes
 
 ---
 
 ## 2. Scaling Strategy
 
-### Horizontal Scaling
+### Horizontal Scaling — Hybrid Local + Cloud
 
-| Component | Strategy |
-|---|---|
-| FastAPI | Add more `backend` containers behind a load balancer |
-| RQ Workers | Add more `worker` containers — all share the same Redis queue |
-| Ray Serve replicas | Autoscale via Ray — increase `max_replicas` in `serve_config.yaml` |
-| PostgreSQL | Read replicas for analytics queries (`/v1/usage/*`) |
-| Redis | Redis Sentinel or Cluster for HA |
+| Component | Local Strategy | Cloud Burst Strategy |
+|---|---|---|
+| **FastAPI backend** | Docker Swarm replicas (×4 across 2 workers) | Cloud Run `ai-backend` min=0, max=20 |
+| **vLLM inference** | 1 instance per GPU worker, 2 total | Cloud Run GPU `ai-vllm` min=0, max=20 |
+| **RQ Workers** | Docker Swarm replicas (×4) | Cloud Run Jobs (planned v1.2) |
+| **PostgreSQL** | Single primary on Manager node | Cloud SQL (read replica planned v1.2) |
+| **Redis** | Single instance on Manager | Memorystore (used by Cloud Run) |
+| **Routing** | Hybrid Router (CPU-based, auto) | Triggered at `BURST_THRESHOLD` (default 70%) |
+
+### Burst Scaling Configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BURST_THRESHOLD` | 70% | CPU % that triggers cloud routing |
+| `SCALE_DOWN_THRESHOLD` | 40% | CPU % to return to local-only |
+| `BURST_CONFIRM_SECS` | 30s | Time CPU must be high before bursting |
+| `SCALE_DOWN_SECS` | 60s | Time CPU must be low before scale-down |
+| `BURST_MIN_INSTANCES` | 2 | Cloud Run min-instances when bursting |
+| `CIRCUIT_BREAKER_MAX` | 3 | Local errors before forcing cloud route |
 
 ### Vertical Scaling Limits
 
