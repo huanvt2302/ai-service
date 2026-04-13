@@ -1,0 +1,206 @@
+version: "3.9"
+
+x-common-env: &common-env
+  DATABASE_URL: "postgresql://aiplatform:aiplatform@postgres:5432/aiplatform"
+  REDIS_URL: "redis://redis:6379"
+  RAY_ADDRESS: "ray://ray:10001"
+  VLLM_BASE_URL: "http://vllm:8000"
+
+services:
+  # ── PostgreSQL + pgvector ────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aiplatform
+      POSTGRES_PASSWORD: aiplatform
+      POSTGRES_DB: aiplatform
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiplatform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ai_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Ray Head Node ────────────────────────────────────────────────────────
+  ray:
+    image: rayproject/ray:2.9.0
+    container_name: ai_ray
+    restart: unless-stopped
+    command: >
+      ray start --head
+      --dashboard-host=0.0.0.0
+      --port=6380
+      --ray-client-server-port=10001
+      --object-manager-port=8076
+      --node-manager-port=8077
+      --block
+    environment:
+      RAY_DISABLE_MEMORY_MONITOR: "1"
+    ports:
+      - "8265:8265"   # Ray Dashboard
+      - "10001:10001" # Ray client
+      - "6380:6380"   # Ray Redis
+    shm_size: "2gb"
+    volumes:
+      - ./backend/serve:/app/serve
+    healthcheck:
+      test: ["CMD-SHELL", "ray status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── vLLM Server (CPU fallback if no GPU) ────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: ai_vllm
+    restart: unless-stopped
+    command: >
+      --model Qwen/Qwen2.5-3B-Instruct
+      --served-model-name qwen3.5-plus
+      --host 0.0.0.0
+      --port 8000
+      --device cpu
+      --dtype float32
+      --max-model-len 4096
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    environment:
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles: ["vllm"]  # optional: start with --profile vllm
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai_backend
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      JWT_SECRET: "${JWT_SECRET:-super-secret-jwt-key-change-in-prod}"
+      JWT_ALGORITHM: "HS256"
+      JWT_EXPIRE_MINUTES: "60"
+      VLLM_BASE_URL: "${VLLM_BASE_URL:-http://vllm:8000}"
+      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://vllm:8000}"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://frontend:3000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - upload_data:/app/uploads
+    command: >
+      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8080 --reload"
+
+  # ── RQ Worker (document ingestion) ──────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai_worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - upload_data:/app/uploads
+    command: rq worker --with-scheduler --url redis://redis:6379 document_queue
+
+  # ── Next.js Frontend ─────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:8080"
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET:-frontend-secret}"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    ports:
+      - "9090:9090"
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  upload_data:
+  hf_cache:
+
+networks:
+  default:
+    name: ai_platform_net

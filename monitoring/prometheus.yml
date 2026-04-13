@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "ai-platform-backend"
+    static_configs:
+      - targets: ["backend:8080"]
+    metrics_path: "/metrics"
+
+  - job_name: "ray-serve"
+    static_configs:
+      - targets: ["ray:8265"]
+    metrics_path: "/metrics"
+
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis:9121"]
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres:9187"]
