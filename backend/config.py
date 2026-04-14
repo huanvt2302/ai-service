@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     embedding_base_url: str = "http://localhost:8000"
     default_chat_model: str = "qwen3.5-plus"
     default_embedding_model: str = "text-embedding-3-small"
-
+    default_system_prompt: str = "Bạn là Pluxion, một trợ lý AI thông minh và hữu ích. Được phát triển bở đội ngữ PluxCore"
 
     # CORS
     allowed_origins: str = "http://localhost:3000"

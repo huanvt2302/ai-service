@@ -127,6 +127,13 @@ async def chat_completions(
     body = await get_safe_json(request)
     model = body.get("model", settings.default_chat_model)
     stream = body.get("stream", False)
+
+    # Inject default system prompt if not present
+    messages = body.get("messages", [])
+    if not any(m.get("role") == "system" for m in messages):
+        messages.insert(0, {"role": "system", "content": settings.default_system_prompt})
+        body["messages"] = messages
+
     start = time.time()
 
     url = _build_llm_url(settings.llm_base_url, "chat/completions")
@@ -376,7 +383,14 @@ async def memchat_completions(
 
     # Merge history with new messages
     new_messages = body.get("messages", [])
-    body["messages"] = history + new_messages
+    merged_messages = history + new_messages
+
+    # Inject default system prompt if not present
+    if not any(m.get("role") == "system" for m in merged_messages):
+        merged_messages.insert(0, {"role": "system", "content": settings.default_system_prompt})
+
+    body["messages"] = merged_messages
+
 
     # Save last user message to memory before calling LLM
     if contact_id and agent_id and new_messages:
