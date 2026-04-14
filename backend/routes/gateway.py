@@ -1,7 +1,8 @@
-"""LLM Gateway routes — proxies to vLLM / Ray Serve with SSE streaming"""
+"""LLM Gateway routes — proxies to llama-cpp with SSE streaming"""
 import httpx
 import json
 import time
+import logging
 from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -13,6 +14,7 @@ from metrics import TOKEN_USAGE, EMBEDDING_REQUESTS
 
 settings = get_settings()
 router = APIRouter(tags=["gateway"])
+logger = logging.getLogger(__name__)
 
 
 MODELS = [
@@ -21,16 +23,30 @@ MODELS = [
 ]
 
 
+# ── URL Builder ───────────────────────────────────────────────────────────────
+
+def _build_llm_url(base_url: str, path: str) -> str:
+    """Build a correct LLM endpoint URL avoiding double /v1 when base already ends with /v1.
+
+    Fix: Previously base_url (e.g. 'http://llama-cpp:8080/v1') had /v1 appended again,
+    producing '/v1/v1/chat/completions'. Now strips any trailing /v1 suffix before appending.
+    """
+    # Normalise: strip trailing slash + /v1 suffix if present
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return f"{base}/v1/{path.lstrip('/')}"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def log_usage(db: Session, api_key: ApiKey, service: str, model: str,
               input_tokens: int, output_tokens: int, latency_ms: float,
               status_code: int, endpoint: str):
     """Log usage to database and Prometheus metrics.
-    
+
     Errors in logging don't prevent the response from being returned.
     """
-    import logging
-    logger = logging.getLogger(__name__)
-    
     try:
         total = input_tokens + output_tokens
         log = UsageLog(
@@ -47,10 +63,11 @@ def log_usage(db: Session, api_key: ApiKey, service: str, model: str,
         )
         db.add(log)
 
-        # Update subscription usage
-        sub = db.query(Subscription).filter(Subscription.team_id == api_key.team_id).first()
-        if sub:
-            sub.tokens_used = (sub.tokens_used or 0) + total
+        # Update subscription usage (only on success)
+        if 200 <= status_code < 300 and total > 0:
+            sub = db.query(Subscription).filter(Subscription.team_id == api_key.team_id).first()
+            if sub:
+                sub.tokens_used = (sub.tokens_used or 0) + total
         db.commit()
     except Exception as e:
         logger.error(f"Failed to log usage for {service}/{endpoint}: {e}")
@@ -69,7 +86,7 @@ def log_usage(db: Session, api_key: ApiKey, service: str, model: str,
 
 def check_quota(db: Session, team_id) -> bool:
     """Returns True if team has quota remaining.
-    
+
     If quota check fails, allow the request through (graceful degradation).
     """
     try:
@@ -78,10 +95,7 @@ def check_quota(db: Session, team_id) -> bool:
             return True
         return (sub.tokens_used or 0) < sub.token_quota
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Failed to check quota for team {team_id}: {e}")
-        # Allow through on error
         return True
 
 
@@ -93,6 +107,8 @@ async def get_safe_json(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
 
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/v1/models")
 def list_models(api_key: ApiKey = Depends(get_current_team_from_api_key)):
@@ -113,146 +129,131 @@ async def chat_completions(
     stream = body.get("stream", False)
     start = time.time()
 
+    url = _build_llm_url(settings.llm_base_url, "chat/completions")
+    client: httpx.AsyncClient = request.app.state.http_client
+
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            if stream:
-                async def event_stream():
-                    input_tokens = 0
-                    output_tokens = 0
-                    try:
-                        try:
-                            url = f"{settings.vllm_base_url.rstrip('/')}/chat/completions" if settings.vllm_base_url.endswith("/v1") or settings.vllm_base_url.endswith("/v1/") else f"{settings.vllm_base_url.rstrip('/')}/v1/chat/completions"
-                            async with client.stream(
-                                "POST",
-                                url,
-                                json=body,
-                                headers={"Content-Type": "application/json"},
-                            ) as resp:
-                                if resp.status_code != 200:
-                                    error_body = await resp.aread()
-                                    import logging
-                                    logger = logging.getLogger(__name__)
-                                    logger.error(f"Error response from vLLM stream [{resp.status_code}]: {error_body.decode('utf-8', errors='replace')}")
-                                    error_msg = {
-                                        "id": "chatcmpl-error",
-                                        "object": "chat.completion.chunk",
-                                        "model": model,
-                                        "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": "error"}],
-                                        "error": {"message": f"Bad response from AI engine ({resp.status_code})", "type": "server_error"}
-                                    }
-                                    yield f"data: {json.dumps(error_msg)}\n\ndata: [DONE]\n\n"
-                                    return
-                                    
-                                async for line in resp.aiter_lines():
-                                    if line:
-                                        yield f"{line}\n\n"
-                                        if line.startswith("data:") and "[DONE]" not in line:
-                                            try:
-                                                chunk = json.loads(line[5:])
-                                                usage = chunk.get("usage") or {}
-                                                output_tokens += usage.get("completion_tokens", 0)
-                                            except Exception:
-                                                pass
-                        except httpx.ConnectError:
-                            # Fallback stub for dev without vLLM
-                            stub = {
-                                "id": "chatcmpl-stub",
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{"delta": {"content": "[vLLM not connected — stub response]"}, "index": 0, "finish_reason": "stop"}],
-                            }
-                            yield f"data: {json.dumps(stub)}\n\ndata: [DONE]\n\n"
-                        except Exception as e:
-                            # Stream error - log and send error message
-                            import logging
-                            logger = logging.getLogger(__name__)
-                            logger.error(f"Error in chat completion stream: {type(e).__name__}: {e}")
-                            error_msg = {
-                                "id": "chatcmpl-error",
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": "error"}],
-                                "error": {"message": "Stream interrupted", "type": "server_error"}
-                            }
-                            yield f"data: {json.dumps(error_msg)}\n\ndata: [DONE]\n\n"
-                        finally:
-                            latency = (time.time() - start) * 1000
-                            log_usage(db, api_key, "chat", model, input_tokens, output_tokens, latency, 200, "/v1/chat/completions")
-                    except Exception as e:
-                        # Catch any exceptions that might occur in the generator itself
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.error(f"Critical error in event_stream generator: {type(e).__name__}: {e}")
-
-                return StreamingResponse(event_stream(), media_type="text/event-stream")
-            else:
+        if stream:
+            async def event_stream():
+                input_tokens = 0
+                output_tokens = 0
                 try:
-                    url = f"{settings.vllm_base_url.rstrip('/')}/chat/completions" if settings.vllm_base_url.endswith("/v1") or settings.vllm_base_url.endswith("/v1/") else f"{settings.vllm_base_url.rstrip('/')}/v1/chat/completions"
-                    resp = await client.post(
-                        url,
-                        json=body,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    
-                    if resp.status_code != 200:
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.error(f"Error response from vLLM [{resp.status_code}]: {resp.text}")
-                        latency = (time.time() - start) * 1000
-                        log_usage(db, api_key, "chat", model, 0, 0, latency, resp.status_code, "/v1/chat/completions")
-                        raise HTTPException(status_code=502, detail=f"Bad response from AI engine ({resp.status_code})")
-
                     try:
-                        result = resp.json()
-                    except json.JSONDecodeError as e:
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.error(f"Failed to decode JSON response from vLLM: {e}. Body: {resp.text}")
+                        async with client.stream(
+                            "POST",
+                            url,
+                            json=body,
+                            headers={"Content-Type": "application/json"},
+                        ) as resp:
+                            if resp.status_code != 200:
+                                error_body = await resp.aread()
+                                logger.error(f"Error response from LLM stream [{resp.status_code}]: {error_body.decode('utf-8', errors='replace')}")
+                                error_msg = {
+                                    "id": "chatcmpl-error",
+                                    "object": "chat.completion.chunk",
+                                    "model": model,
+                                    "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": "error"}],
+                                    "error": {"message": f"Bad response from AI engine ({resp.status_code})", "type": "server_error"}
+                                }
+                                yield f"data: {json.dumps(error_msg)}\n\ndata: [DONE]\n\n"
+                                return
+
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield f"{line}\n\n"
+                                    if line.startswith("data:") and "[DONE]" not in line:
+                                        try:
+                                            chunk = json.loads(line[5:])
+                                            usage = chunk.get("usage") or {}
+                                            output_tokens += usage.get("completion_tokens", 0)
+                                        except Exception:
+                                            pass
+                    except httpx.ConnectError:
+                        # Fix: stub log with 503, 0 tokens — not fake billing data
                         latency = (time.time() - start) * 1000
-                        log_usage(db, api_key, "chat", model, 0, 0, latency, resp.status_code, "/v1/chat/completions")
-                        raise HTTPException(status_code=502, detail="Invalid JSON response from AI service")
-                    
-                    usage = result.get("usage", {})
+                        log_usage(db, api_key, "chat", model, 0, 0, latency, 503, "/v1/chat/completions")
+                        stub = {
+                            "id": "chatcmpl-stub",
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"delta": {"content": "[LLM not connected — stub response]"}, "index": 0, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(stub)}\n\ndata: [DONE]\n\n"
+                        return
+                    except Exception as e:
+                        logger.error(f"Error in chat completion stream: {type(e).__name__}: {e}")
+                        error_msg = {
+                            "id": "chatcmpl-error",
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"delta": {"content": ""}, "index": 0, "finish_reason": "error"}],
+                            "error": {"message": "Stream interrupted", "type": "server_error"}
+                        }
+                        yield f"data: {json.dumps(error_msg)}\n\ndata: [DONE]\n\n"
+                    finally:
+                        latency = (time.time() - start) * 1000
+                        log_usage(db, api_key, "chat", model, input_tokens, output_tokens, latency, 200, "/v1/chat/completions")
+                except Exception as e:
+                    logger.error(f"Critical error in event_stream generator: {type(e).__name__}: {e}")
+
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+        else:
+            try:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                )
+
+                if resp.status_code != 200:
+                    logger.error(f"Error response from LLM [{resp.status_code}]: {resp.text}")
                     latency = (time.time() - start) * 1000
-                    log_usage(db, api_key, "chat", model,
-                              usage.get("prompt_tokens", 0),
-                              usage.get("completion_tokens", 0),
-                              latency, resp.status_code, "/v1/chat/completions")
-                    return result
-                except httpx.ConnectError:
+                    log_usage(db, api_key, "chat", model, 0, 0, latency, resp.status_code, "/v1/chat/completions")
+                    raise HTTPException(status_code=502, detail=f"Bad response from AI engine ({resp.status_code})")
+
+                try:
+                    result = resp.json()
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to decode JSON response from LLM: {e}. Body: {resp.text}")
                     latency = (time.time() - start) * 1000
-                    log_usage(db, api_key, "chat", model, 10, 20, latency, 200, "/v1/chat/completions")
-                    return {
-                        "id": "chatcmpl-stub",
-                        "object": "chat.completion",
-                        "model": model,
-                        "choices": [{
-                            "message": {"role": "assistant", "content": "Hello! I'm running in stub mode (vLLM not connected). Configure VLLM_BASE_URL to connect a real model."},
-                            "finish_reason": "stop",
-                            "index": 0,
-                        }],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
-                    }
-                except httpx.RequestError as e:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.error(f"HTTP request error in chat_completions: {type(e).__name__}: {e}")
-                    latency = (time.time() - start) * 1000
-                    log_usage(db, api_key, "chat", model, 0, 0, latency, 0, "/v1/chat/completions")
-                    raise HTTPException(status_code=502, detail="Failed to communicate with AI service")
+                    log_usage(db, api_key, "chat", model, 0, 0, latency, resp.status_code, "/v1/chat/completions")
+                    raise HTTPException(status_code=502, detail="Invalid JSON response from AI service")
+
+                usage = result.get("usage", {})
+                latency = (time.time() - start) * 1000
+                log_usage(db, api_key, "chat", model,
+                          usage.get("prompt_tokens", 0),
+                          usage.get("completion_tokens", 0),
+                          latency, resp.status_code, "/v1/chat/completions")
+                return result
+            except httpx.ConnectError:
+                latency = (time.time() - start) * 1000
+                # Fix: log 503 with 0 tokens — previously logged fake 30 tokens with status 200
+                log_usage(db, api_key, "chat", model, 0, 0, latency, 503, "/v1/chat/completions")
+                return {
+                    "id": "chatcmpl-stub",
+                    "object": "chat.completion",
+                    "model": model,
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "Hello! I'm running in stub mode (LLM not connected). Configure VLLM_BASE_URL to connect a real model."},
+                        "finish_reason": "stop",
+                        "index": 0,
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                }
+            except httpx.RequestError as e:
+                logger.error(f"HTTP request error in chat_completions: {type(e).__name__}: {e}")
+                latency = (time.time() - start) * 1000
+                log_usage(db, api_key, "chat", model, 0, 0, latency, 0, "/v1/chat/completions")
+                raise HTTPException(status_code=502, detail="Failed to communicate with AI service")
     except HTTPException:
-        # Re-raise HTTP exceptions (e.g., 429 quota exceeded)
         raise
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Error in chat_completions: {type(e).__name__}: {e}")
-        # Don't expose internal error details to client
         raise HTTPException(
             status_code=500,
             detail="Chat completion service temporarily unavailable. Please try again."
         )
-
 
 @router.post("/v1/embeddings")
 async def embeddings(
@@ -264,20 +265,19 @@ async def embeddings(
     model = body.get("model", settings.default_embedding_model)
     start = time.time()
 
+    url = _build_llm_url(settings.embedding_base_url, "embeddings")
+    client: httpx.AsyncClient = request.app.state.http_client
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            try:
-                url = f"{settings.vllm_base_url.rstrip('/')}/embeddings" if settings.vllm_base_url.endswith("/v1") or settings.vllm_base_url.endswith("/v1/") else f"{settings.vllm_base_url.rstrip('/')}/v1/embeddings"
+        try:
                 resp = await client.post(
                     url,
                     json=body,
                     headers={"Content-Type": "application/json"},
                 )
-                
+
                 if resp.status_code != 200:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.error(f"Error response from vLLM embeddings [{resp.status_code}]: {resp.text}")
+                    logger.error(f"Error response from LLM embeddings [{resp.status_code}]: {resp.text}")
                     latency = (time.time() - start) * 1000
                     log_usage(db, api_key, "embeddings", model, 0, 0, latency, resp.status_code, "/v1/embeddings")
                     raise HTTPException(status_code=502, detail=f"Bad response from AI engine ({resp.status_code})")
@@ -285,12 +285,11 @@ async def embeddings(
                 try:
                     result = resp.json()
                 except json.JSONDecodeError as e:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.error(f"Failed to decode JSON response from vLLM embeddings: {e}. Body: {resp.text}")
+                    logger.error(f"Failed to decode JSON response from LLM embeddings: {e}. Body: {resp.text}")
                     latency = (time.time() - start) * 1000
                     log_usage(db, api_key, "embeddings", model, 0, 0, latency, resp.status_code, "/v1/embeddings")
                     raise HTTPException(status_code=502, detail="Invalid JSON response from AI service")
+
                 usage = result.get("usage", {})
                 latency = (time.time() - start) * 1000
                 log_usage(db, api_key, "embeddings", model,
@@ -298,27 +297,23 @@ async def embeddings(
                 try:
                     EMBEDDING_REQUESTS.labels(model=model).inc()
                 except Exception as e:
-                    import logging
-                    logger = logging.getLogger(__name__)
                     logger.warning(f"Failed to update embedding metrics: {e}")
                 return result
-            except httpx.ConnectError:
-                # Return zero-vector stub
+        except httpx.ConnectError:
+                # Fix: return stub with 0 tokens and 503 status — not fake billing data
                 import random
                 embedding = [random.uniform(-0.1, 0.1) for _ in range(1536)]
                 latency = (time.time() - start) * 1000
-                log_usage(db, api_key, "embeddings", model, 10, 0, latency, 200, "/v1/embeddings")
+                log_usage(db, api_key, "embeddings", model, 0, 0, latency, 503, "/v1/embeddings")
                 return {
                     "object": "list",
                     "model": model,
                     "data": [{"object": "embedding", "index": 0, "embedding": embedding}],
-                    "usage": {"prompt_tokens": 10, "total_tokens": 10},
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
                 }
     except HTTPException:
         raise
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"Error in embeddings: {type(e).__name__}: {e}")
         raise HTTPException(
             status_code=500,
@@ -360,7 +355,12 @@ async def memchat_completions(
     api_key: ApiKey = Depends(get_current_team_from_api_key),
     db: Session = Depends(get_db),
 ):
-    """Chat completions with conversation memory."""
+    """Chat completions with conversation memory.
+
+    Fix: Previously used chat_completions.__wrapped__ which never existed,
+    causing this endpoint to always return a stub response. Now properly
+    injects history and calls the LLM directly.
+    """
     body = await get_safe_json(request)
     contact_id = body.get("contact_id")
     agent_id = body.get("agent_id")
@@ -375,12 +375,12 @@ async def memchat_completions(
         history = [{"role": m.role, "content": m.content} for m in msgs]
 
     # Merge history with new messages
-    messages = history + body.get("messages", [])
-    body["messages"] = messages
+    new_messages = body.get("messages", [])
+    body["messages"] = history + new_messages
 
-    # Save user message
-    if contact_id and agent_id and body.get("messages"):
-        last = body["messages"][-1]
+    # Save last user message to memory before calling LLM
+    if contact_id and agent_id and new_messages:
+        last = new_messages[-1]
         db.add(AgentMessage(
             agent_id=agent_id,
             contact_id=contact_id,
@@ -389,12 +389,56 @@ async def memchat_completions(
         ))
         db.commit()
 
-    # Proxy to /v1/chat/completions logic
-    return await chat_completions.__wrapped__(request, api_key, db) if hasattr(chat_completions, "__wrapped__") else {
-        "id": "memchat-stub",
-        "object": "chat.completion",
-        "choices": [{"message": {"role": "assistant", "content": "Memory chat response"}, "finish_reason": "stop", "index": 0}],
-    }
+    # Build a fresh Request-like payload and call LLM directly
+    model = body.get("model", settings.default_chat_model)
+    start = time.time()
+    url = _build_llm_url(settings.llm_base_url, "chat/completions")
+    client: httpx.AsyncClient = request.app.state.http_client
+
+    try:
+        resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Bad response from AI engine ({resp.status_code})")
+        result = resp.json()
+
+        # Save assistant reply
+        if contact_id and agent_id:
+            try:
+                choices = result.get("choices", [])
+                if choices:
+                    assistant_content = choices[0].get("message", {}).get("content", "")
+                    if assistant_content:
+                        db.add(AgentMessage(
+                            agent_id=agent_id,
+                            contact_id=contact_id,
+                            role="assistant",
+                            content=assistant_content,
+                        ))
+                        db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to save assistant reply to memory: {e}")
+
+        latency = (time.time() - start) * 1000
+        usage = result.get("usage", {})
+        log_usage(db, api_key, "chat", model,
+                  usage.get("prompt_tokens", 0),
+                  usage.get("completion_tokens", 0),
+                  latency, resp.status_code, "/v1/memchat/completions")
+        return result
+    except httpx.ConnectError:
+        latency = (time.time() - start) * 1000
+        log_usage(db, api_key, "chat", model, 0, 0, latency, 503, "/v1/memchat/completions")
+        return {
+            "id": "memchat-stub",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "[LLM not connected — stub response]"}, "finish_reason": "stop", "index": 0}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in memchat_completions: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Memory chat service temporarily unavailable.")
 
 
 @router.get("/v1/messages")

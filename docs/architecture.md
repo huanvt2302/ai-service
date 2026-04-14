@@ -65,7 +65,7 @@
       └─────────────────────────┘  │  │ document_worker.py                │   │
                                    │  │ 1. Read uploaded file             │   │
                                    │  │ 2. Chunk text (512w, 64 overlap)  │   │
-                                   │  │ 3. Call vLLM /v1/embeddings       │   │
+                                   │  │ 3. Call /v1/embeddings endpoint   │   │
                                    │  │ 4. Store DocumentChunk + vector   │   │
                                    │  │ 5. Update Document.status = done  │   │
                                    │  └───────────────────────────────────┘   │
@@ -88,10 +88,9 @@
                                    │  │    on configured model           │    │
                                    │  └──────────────────────────────────┘    │
                                    │                                          │
-                                   │  llama.cpp Server (port 8080, host :11434)       │
-                                   │   image: ghcr.io/ggerganov/llama.cpp:server       │
-                                   │   model: Qwen2.5-3B-Instruct-Q4_K_M.gguf         │
-                                   │   served as: qwen3.5-plus (CPU / macOS ARM64)     │
+                                   │  MLX Server (Host macOS port 8080)       │
+                                   │   model: mlx-community/Qwen3.5-4B-Instruct-4bit │
+                                   │   served natively on Apple Silicon       │
                                    └──────────────────────────────────────────────────┘
 ```
 
@@ -108,8 +107,8 @@
 | `frontend` | Next.js 14 / TypeScript | 3000 | Console UI | Workers |
 | `backend` | Python / FastAPI | 8080 | API Gateway + business logic | Workers (×4) |
 | `worker` | Python / RQ | — | Document ingestion background jobs | Workers (×4) |
-| `model-downloader` | Python / huggingface_hub | — | Init container: download GGUF model on first start | Workers |
-| `llama-cpp` | ghcr.io/ggerganov/llama.cpp | 11434→8080 | LLM serving — OpenAI-compatible (llama.cpp server) | Workers |
+| `model-downloader` | Python / huggingface_hub | — | Init container: download GGUF model on first start (legacy/prod only) | Workers |
+| `mlx-server` | Python / mlx-lm | 8080 | LLM serving — OpenAI-compatible (runs native on Host) | macOS Host |
 | `postgres` | pgvector/pgvector:pg16 | 5432 | Relational DB + vector store | Manager |
 | `redis` | redis:7-alpine | 6379 | Rate limiting + task queue + cache | Manager |
 | `node-exporter` | prom/node-exporter | 9100 | Host CPU/memory metrics (global) | All Nodes |
@@ -142,10 +141,10 @@ FastAPI Gateway
   ├─► [2] Redis rate limit check (sliding window, key=api_key.id)
   ├─► [3] Quota check (subscriptions.tokens_used < token_quota)
   │
-  ├─► [4] HTTP/SSE proxy to vLLM   (VLLM_BASE_URL/v1/chat/completions)
+  ├─► [4] HTTP/SSE proxy to Inference Server   (VLLM_BASE_URL/v1/chat/completions)
   │        │
   │        ▼
-  │       vLLM → generates tokens
+  │       Inference Server → generates tokens
   │        │
   │        └─► SSE chunks streamed back (if stream=true)
   │
@@ -175,7 +174,7 @@ RQ Worker (workers/document_worker.py)
   │
   ├─► Read file → extract text
   ├─► Chunk text (512 words, 64-word overlap)
-  ├─► POST /v1/embeddings to vLLM  (batch)
+  ├─► POST /v1/embeddings to Inference Server  (batch)
   ├─► INSERT DocumentChunk rows  (content + embedding vector)
   ├─► UPDATE Document (status=done, chunk_count=N)
   └─► (on error) UPDATE Document (status=error, error_message=...)
@@ -217,7 +216,7 @@ Authorization: Bearer <JWT>
 ## 5. RAG Pipeline
 
 ```
-Upload → Save → Chunk(512w/64overlap) → Embed(vLLM) → pgvector(IVFFlat)
+Upload → Save → Chunk(512w/64overlap) → Embed(API) → pgvector(IVFFlat)
                                                               │
 Search:  Query → Embed → cosine_distance ORDER BY → top-k chunks returned
 ```
@@ -281,11 +280,14 @@ For **local development** only. Use `docker-compose.yml` with `docker compose up
                     └─► redis:6379                                  │
   worker ──────────────► redis:6379 ◄── RQ jobs                    │
                          postgres:5432                              │
-  llama-cpp ◄─ backend ──► :8080 (host :11434, alias qwen3.5-plus)   │
-  model-downloader ──────► models_data volume (init, runs once)       │
   prometheus ──────────► backend:8080/metrics                      │
   grafana ─────────────► prometheus:9090                           │
-                    └────────────────────────────────────────-─────┘
+                    └───────────┬──────────────────────────────────-─────┘
+                                │ host.docker.internal:9999
+                    ┌───────────▼────────────────────────────────────────┐
+                    │ macOS Host                                         │
+                    │ mlx_lm.server (Native Apple Silicon Qwen3.5-4B)    │
+                    └────────────────────────────────────────────────────┘
 ```
 
 ---

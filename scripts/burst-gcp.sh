@@ -280,7 +280,7 @@ deploy_cloud_run() {
         --timeout=300 \
         --add-cloudsql-instances="${INSTANCE_CONNECTION}" \
         --set-secrets="DATABASE_URL=DATABASE_URL:latest,REDIS_URL=REDIS_URL:latest,JWT_SECRET=JWT_SECRET:latest" \
-        --set-env-vars="VLLM_BASE_URL=\${VLLM_CLOUD_URL:-}" \
+        --set-env-vars="LLM_BASE_URL=\${VLLM_CLOUD_URL:-}" \
         --port=8080 \
         --quiet
 
@@ -315,7 +315,7 @@ deploy_cloud_run() {
     if [[ -n "${VLLM_URL}" ]]; then
         gcloud run services update ai-backend \
             --region="${GCP_REGION}" \
-            --set-env-vars="VLLM_BASE_URL=${VLLM_URL}" \
+            --set-env-vars="LLM_BASE_URL=${VLLM_URL}" \
             --quiet
     fi
 

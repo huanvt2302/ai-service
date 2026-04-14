@@ -22,6 +22,3 @@ python-dotenv==1.0.1
 tiktoken==0.7.0
 sentence-transformers==2.7.0
 numpy==1.26.4
-# Ray Serve (optional, comment out if not using)
-# ray[serve]==2.9.0
-# vllm==0.4.2

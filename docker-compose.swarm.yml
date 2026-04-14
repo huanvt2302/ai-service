@@ -10,6 +10,7 @@ x-redis-env: &redis-env
 x-common-env: &common-env
   <<: *db-env
   <<: *redis-env
+  LLM_BASE_URL: "http://llama-cpp:8080/v1"
 
 # ── Logging default ────────────────────────────────────────────────────────────
 x-logging: &default-logging
@@ -65,7 +66,7 @@ services:
       PROMETHEUS_URL:       "http://prometheus:9090"
       GCP_PROJECT:          "${GCP_PROJECT:-}"
       GCP_REGION:           "${GCP_REGION:-asia-southeast1}"
-      CLOUD_RUN_SERVICES:   "${CLOUD_RUN_SERVICES:-ai-backend,ai-vllm}"
+      CLOUD_RUN_SERVICES:   "${CLOUD_RUN_SERVICES:-ai-backend,ai-llama-cpp}"
       BURST_THRESHOLD:      "${BURST_THRESHOLD:-70}"
       SCALE_DOWN_THRESHOLD: "${SCALE_DOWN_THRESHOLD:-40}"
       BURST_MIN_INSTANCES:  "${BURST_MIN_INSTANCES:-2}"
@@ -88,131 +89,6 @@ services:
       restart_policy:
         condition: on-failure
         delay: 10s
-
-  # ── FastAPI Backend (stateless workers) ───────────────────────────────────────
-  backend:
-    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
-    environment:
-      <<: *common-env
-      JWT_SECRET:         "${JWT_SECRET:?JWT_SECRET required}"
-      JWT_ALGORITHM:      "HS256"
-      JWT_EXPIRE_MINUTES: "60"
-      VLLM_BASE_URL:      "http://vllm:8000"
-      EMBEDDING_BASE_URL: "http://vllm:8000"
-      ALLOWED_ORIGINS:    "${ALLOWED_ORIGINS:-http://localhost:80}"
-      GCS_BUCKET:         "${GCS_BUCKET:-}"    # for file uploads
-    command: >
-      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8080"
-    volumes:
-      - upload_data:/app/uploads    # local fallback; prefer GCS via env
-    networks:
-      - ai_swarm_net
-    logging: *default-logging
-    deploy:
-      replicas: 4                   # 2 per worker node by default
-      placement:
-        constraints:
-          - node.role == worker
-      update_config:
-        parallelism: 2
-        delay: 10s
-        failure_action: rollback
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-      resources:
-        limits:
-          cpus:   "2"
-          memory: "2G"
-        reservations:
-          cpus:   "0.5"
-          memory: "512M"
-
-  # ── RQ Document Worker ────────────────────────────────────────────────────────
-  worker:
-    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
-    environment:
-      <<: *common-env
-      VLLM_BASE_URL:  "http://vllm:8000"
-      GCS_BUCKET:     "${GCS_BUCKET:-}"
-    command: >
-      rq worker --with-scheduler --url redis://redis:6379 document_queue
-    volumes:
-      - upload_data:/app/uploads
-    networks:
-      - ai_swarm_net
-    logging: *default-logging
-    deploy:
-      replicas: 4
-      placement:
-        constraints:
-          - node.role == worker
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-      resources:
-        limits:
-          cpus:   "1"
-          memory: "1G"
-
-  # ── vLLM Inference Server (GPU) ───────────────────────────────────────────────
-  vllm:
-    image: vllm/vllm-openai:latest
-    command: >
-      --model ${VLLM_MODEL:-Qwen/Qwen2.5-3B-Instruct}
-      --served-model-name ${VLLM_SERVED_NAME:-qwen3.5-plus}
-      --host 0.0.0.0
-      --port 8000
-      --max-model-len ${VLLM_MAX_LEN:-4096}
-    environment:
-      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
-    volumes:
-      - hf_cache:/root/.cache/huggingface
-    networks:
-      - ai_swarm_net
-    logging: *default-logging
-    deploy:
-      replicas: 2                   # 1 per GPU worker node
-      placement:
-        constraints:
-          - node.role == worker
-          - node.labels.gpu == "true"
-      restart_policy:
-        condition: on-failure
-        delay: 10s
-      resources:
-        limits:
-          cpus:   "6"
-          memory: "20G"
-        # NOTE: GPU resources in Swarm require the nvidia plugin.
-        # Uncomment if nvidia-container-runtime is installed:
-        # generic_resources:
-        #   - discrete_resource_spec:
-        #       kind: "NVIDIA-GPU"
-        #       value: 1
-
-  # ── Next.js Frontend ──────────────────────────────────────────────────────────
-  frontend:
-    image: ${REGISTRY:-localhost:5000}/frontend:${TAG:-latest}
-    environment:
-      NEXT_PUBLIC_API_URL: "http://${MACHINE1_IP:-localhost}:80"
-      NEXTAUTH_SECRET:     "${NEXTAUTH_SECRET:?NEXTAUTH_SECRET required}"
-    networks:
-      - ai_swarm_net
-    logging: *default-logging
-    deploy:
-      replicas: 2
-      placement:
-        constraints:
-          - node.role == worker
-      update_config:
-        parallelism: 1
-        delay: 5s
-      resources:
-        limits:
-          cpus:   "1"
-          memory: "512M"
 
   # ── PostgreSQL + pgvector ─────────────────────────────────────────────────────
   postgres:
@@ -262,6 +138,166 @@ services:
         limits:
           cpus:   "0.5"
           memory: "600M"
+
+  # ── Model Downloader (one-shot — pulls GGUF from HuggingFace) ─────────────────
+  # Runs once per node that hosts llama-cpp; skips if model already cached.
+  model-downloader:
+    image: python:3.11-slim
+    volumes:
+      - models_data:/models
+      - ./scripts/download_model.py:/app/download_model.py:ro
+    environment:
+      HF_TOKEN:       "${HF_TOKEN:-}"
+      LLAMA_CPP_MODEL: "${LLAMA_CPP_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+      HF_REPO_ID:     "${HF_REPO_ID:-Qwen/Qwen2.5-3B-Instruct-GGUF}"
+    command: ["python", "/app/download_model.py"]
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.llm == "true"    # only on LLM-designated worker
+      restart_policy:
+        condition: none                  # init container — do not restart
+
+  # ── llama.cpp Server — OpenAI-compatible inference (CPU / macOS ARM64) ────────
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command:
+      - "--model"
+      - "/models/${LLAMA_CPP_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+      - "--alias"
+      - "qwen3.5-plus"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--ctx-size"
+      - "${LLAMA_CPP_CTX_SIZE:-8192}"
+      - "--threads"
+      - "${LLAMA_CPP_THREADS:-4}"
+      - "--parallel"
+      - "2"
+    volumes:
+      - models_data:/models
+    environment:
+      LLAMA_CPP_MODEL:    "${LLAMA_CPP_MODEL:-qwen2.5-3b-instruct-q4_k_m.gguf}"
+      LLAMA_CPP_CTX_SIZE: "${LLAMA_CPP_CTX_SIZE:-8192}"
+      LLAMA_CPP_THREADS:  "${LLAMA_CPP_THREADS:-4}"
+    ports:
+      - "11434:8080"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.llm == "true"    # pin to same worker as model-downloader
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus:   "6"
+          memory: "8G"
+        reservations:
+          cpus:   "2"
+          memory: "4G"
+
+  # ── FastAPI Backend (stateless workers) ───────────────────────────────────────
+  backend:
+    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
+    environment:
+      <<: *common-env
+      JWT_SECRET:         "${JWT_SECRET:?JWT_SECRET required}"
+      JWT_ALGORITHM:      "HS256"
+      JWT_EXPIRE_MINUTES: "60"
+      LLM_BASE_URL:      "${LLM_BASE_URL:-http://llama-cpp:8080/v1}"
+      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://llama-cpp:8080/v1}"
+      ALLOWED_ORIGINS:    "${ALLOWED_ORIGINS:-http://localhost:80}"
+      GCS_BUCKET:         "${GCS_BUCKET:-}"    # for file uploads
+    command: >
+      sh -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8080"
+    volumes:
+      - upload_data:/app/uploads    # local fallback; prefer GCS via env
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 4                   # 2 per worker node by default
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 2
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus:   "2"
+          memory: "2G"
+        reservations:
+          cpus:   "0.5"
+          memory: "512M"
+
+  # ── RQ Document Worker ────────────────────────────────────────────────────────
+  worker:
+    image: ${REGISTRY:-localhost:5000}/backend:${TAG:-latest}
+    environment:
+      <<: *common-env
+      LLM_BASE_URL:  "${LLM_BASE_URL:-http://llama-cpp:8080/v1}"
+      GCS_BUCKET:     "${GCS_BUCKET:-}"
+    command: >
+      rq worker --with-scheduler --url redis://redis:6379 document_queue
+    volumes:
+      - upload_data:/app/uploads
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 4
+      placement:
+        constraints:
+          - node.role == worker
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      resources:
+        limits:
+          cpus:   "1"
+          memory: "1G"
+
+  # ── Next.js Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    image: ${REGISTRY:-localhost:5000}/frontend:${TAG:-latest}
+    environment:
+      NEXT_PUBLIC_API_URL: "http://${MACHINE1_IP:-localhost}:80"
+      NEXTAUTH_SECRET:     "${NEXTAUTH_SECRET:?NEXTAUTH_SECRET required}"
+    networks:
+      - ai_swarm_net
+    logging: *default-logging
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 5s
+      resources:
+        limits:
+          cpus:   "1"
+          memory: "512M"
 
   # ── node-exporter (global — runs on EVERY Swarm node) ────────────────────────
   # Exposes host CPU, memory, disk metrics to Prometheus.
@@ -352,7 +388,7 @@ volumes:
     driver: local
   upload_data:
     driver: local
-  hf_cache:
+  models_data:          # GGUF model cache (replaces hf_cache + ollama_data)
     driver: local
 
 # ==============================================================================

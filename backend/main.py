@@ -1,5 +1,6 @@
 """Main FastAPI application — AI Platform Gateway"""
 import os
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -16,7 +17,16 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     # Create upload directory
     os.makedirs(settings.upload_dir, exist_ok=True)
+
+    # Shared keep-alive HTTP client for all LLM proxy calls.
+    # One connection pool per process — avoids per-request TCP handshake overhead.
+    app.state.http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+    )
     yield
+
+    await app.state.http_client.aclose()
 
 
 app = FastAPI(

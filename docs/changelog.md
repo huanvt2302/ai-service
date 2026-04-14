@@ -63,7 +63,10 @@ One paragraph describing what changed and why.
 | 2026-04-11 | [2026-04-11_dashboard_promax_redesign.md](./changelog/2026-04-11_dashboard_promax_redesign.md) | Refactor | Dashboard Data-Dense Glassmorphism redesign |
 | 2026-04-11 | [2026-04-11_create_project_overview.md](./changelog/2026-04-11_create_project_overview.md) | Docs | Created project overview document |
 | 2026-04-13 | [2026-04-13_daily.md](./changelog/2026-04-13_daily.md) | Infra/Refactor/Fix/Docs | Daily: Hybrid Burst arch, vLLM→Ollama→llama.cpp migration, JSON fixes, model upgrades, .gitignore |
-
+| 2026-04-13 | [2026-04-13_sync_swarm_compose.md](./changelog/2026-04-13_sync_swarm_compose.md) | Infrastructure | Sync docker-compose.swarm.yml with llama.cpp architecture (replace vLLM, add Ray) |
+| 2026-04-13 | [2026-04-13_code_review_fixes.md](./changelog/2026-04-13_code_review_fixes.md) | Fix/Security/Refactor | Code review batch: billing RBAC guard, shared httpx client, sentence chunking, webhook dispatch |
+| 2026-04-14 | [2026-04-14_use_mlx_qwen35.md](./changelog/2026-04-14_use_mlx_qwen35.md) | Infrastructure | Migrate inference to native Apple Silicon MLX Server for Qwen3.5-4B |
+| 2026-04-14 | [2026-04-14_clean_up_ray_and_envs.md](./changelog/2026-04-14_clean_up_ray_and_envs.md) | Refactor/Infra | Cleanup deprecated Ray configs and standardize LLM environment variables |
 ---
 
 ## Planned (Roadmap)

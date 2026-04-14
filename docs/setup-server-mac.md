@@ -14,8 +14,7 @@
 | **Disk** | 20 GB free | 50 GB+ (LLM model ~6GB) |
 | **Docker Desktop** | 4.x+ | Latest |
 
-> **⚠️ vLLM trên Mac:** vLLM **không hỗ trợ Apple Silicon GPU** (MPS).
-> Sẽ chạy ở CPU mode — chậm hơn GPU ~10-20x, nhưng hoạt động bình thường cho dev/test.
+> **⚠️ Inference trên Mac:** Để tận dụng nguyên vẹn sức mạnh của GPU Apple Silicon (Metal), module Inference Server sẽ được chạy bản Native (MLX) ở ngoài và Docker sẽ connect tới.
 
 ---
 
@@ -38,7 +37,7 @@ Sau khi cài, **mở Docker Desktop** và tăng resource limit:
 ```
 Docker Desktop → Settings → Resources:
   CPUs:  6+ (recommended)
-  Memory: 8 GB+ (vLLM cần ~4-6 GB)
+  Memory: 8 GB+
   Swap:  2 GB
   Disk:  50 GB+
 ```
@@ -80,7 +79,7 @@ GRAFANA_PASSWORD=admin
 
 ## BƯỚC 3 — Chạy services cơ bản (không có vLLM)
 
-Cách nhanh nhất để kiểm tra hệ thống — **không cần tải LLM model**:
+Cách nhanh nhất để kiểm tra hệ thống:
 
 ```bash
 docker compose up -d
@@ -113,37 +112,34 @@ Truy cập:
 | **Prometheus** | http://localhost:9090 |
 | **Grafana** | http://localhost:3001 (admin / admin) |
 
-> **Chat completion sẽ báo lỗi** nếu chưa bật vLLM — đó là bình thường. Các chức năng khác (auth, RAG, agents...) hoạt động bình thường.
+> **Chat completion sẽ báo lỗi** nếu chưa bật MLX Inference Server. Các chức năng khác (auth, webhooks...) hoạt động bình thường.
 
 ---
 
-## BƯỚC 4 — Thêm vLLM (LLM inference)
+## BƯỚC 4 — Khởi động MLX Inference Server (Native GPU)
 
-> **Cảnh báo:** vLLM CPU mode tốn ~4-6 GB RAM và mất ~3-5 phút khởi động lần đầu (tải model ~6 GB).
-
-```bash
-# Khởi động thêm vLLM
-docker compose --profile vllm up -d vllm
-```
-
-Theo dõi quá trình tải model:
+> **Lưu ý:** MLX dùng để thay thế module LLM server trong docker vì DockerVM không pass-through được Apple Neural engine. Chạy script này bên ngoài docker để sử dụng Apple Metal GPU.
 
 ```bash
-docker logs -f ai_vllm
-# Đợi dòng: "Application startup complete" hoặc "Serving on http://0.0.0.0:8000"
+# Mở một terminal MỚI (bên ngoài Docker)
+chmod +x scripts/start_mlx.sh
+./scripts/start_mlx.sh
 ```
+
+Theo dõi quá trình tải model (Qwen3.5-4B):
+Khi nào thấy báo "Uvicorn running on http://0.0.0.0:9999" là thành công.
 
 Kiểm tra:
 
 ```bash
-curl http://localhost:8000/v1/models
-# {"data":[{"id":"qwen3.5-plus",...}]}
+curl http://localhost:8080/v1/models
+# {"data":[{"id":"mlx-community/Qwen3.5-4B-Instruct-4bit",...}]}
 
 # Test chat
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "x-api-key: sk-your-key" \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.5-plus","messages":[{"role":"user","content":"Xin chào"}]}'
+  -d '{"model":"mlx-community/Qwen3.5-4B-Instruct-4bit","messages":[{"role":"user","content":"Xin chào"}]}'
 ```
 
 ---
@@ -162,11 +158,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ### Khởi động / tắt
 
 ```bash
-# Khởi động tất cả (không có vLLM)
+# Khởi động tất cả database, queue, api
 docker compose up -d
-
-# Khởi động tất cả kể cả vLLM
-docker compose --profile vllm up -d
 
 # Tắt tất cả (giữ data)
 docker compose down
@@ -180,7 +173,6 @@ docker compose down -v
 ```bash
 docker compose logs -f backend     # FastAPI logs
 docker compose logs -f worker      # RQ worker logs
-docker compose logs -f vllm        # vLLM model loading
 docker compose logs -f             # tất cả logs cùng lúc
 ```
 
@@ -288,29 +280,9 @@ docker compose down
 docker compose up -d
 ```
 
-### vLLM chậm / tốn RAM quá nhiều
 
-Dùng model nhỏ hơn. Sửa trong `docker-compose.yml`:
 
-```yaml
-vllm:
-  command: >
-    --model Qwen/Qwen2.5-0.5B-Instruct   # ← 0.5B thay vì 3B
-    --served-model-name qwen3.5-plus
-    --host 0.0.0.0 --port 8000
-    --device cpu --dtype float32
-    --max-model-len 2048                  # ← giảm context length
-```
 
-Hoặc dùng `--quantization awq` nếu model hỗ trợ (giảm ~50% RAM).
-
-### HuggingFace download chậm / timeout
-
-```bash
-# Dùng mirror của HuggingFace
-docker compose down
-HF_ENDPOINT=https://hf-mirror.com docker compose --profile vllm up -d vllm
-```
 
 ### `alembic: command not found` trong container
 
@@ -338,7 +310,7 @@ docker compose up -d --build         # build lại từ đầu
 | Swagger UI | 8080 | http://localhost:8080/docs |
 | PostgreSQL | 5432 | `postgresql://aiplatform:aiplatform@localhost:5432/aiplatform` |
 | Redis | 6379 | `redis://localhost:6379` |
-| vLLM | 8000 | http://localhost:8000/v1 |
+| MLX Server | 8080 (Mac Host) | http://127.0.0.1:8080/v1 |
 | Prometheus | 9090 | http://localhost:9090 |
 | Grafana | 3001 | http://localhost:3001 |
 

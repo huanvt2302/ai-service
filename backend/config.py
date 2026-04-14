@@ -16,13 +16,11 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60
 
     # LLM
-    vllm_base_url: str = "http://localhost:8000"
+    llm_base_url: str = "http://localhost:8000"
     embedding_base_url: str = "http://localhost:8000"
     default_chat_model: str = "qwen3.5-plus"
     default_embedding_model: str = "text-embedding-3-small"
 
-    # Ray
-    ray_address: str = "ray://localhost:10001"
 
     # CORS
     allowed_origins: str = "http://localhost:3000"

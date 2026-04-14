@@ -247,7 +247,7 @@ SELECT * FROM subscriptions WHERE team_id = $1
 
 ## 6. Failure Handling
 
-### 6.1 vLLM Unavailable
+### 6.1 Inference Server Unavailable
 
 Gateway catches `httpx.ConnectError` and returns a **stub response**:
 ```json

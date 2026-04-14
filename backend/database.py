@@ -9,6 +9,8 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
+    pool_recycle=3600,   # Fix: recycle connections after 1h to prevent PostgreSQL idle timeout (default ~8h)
+    pool_timeout=30,     # Raise after 30s if no connection available (instead of hanging)
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

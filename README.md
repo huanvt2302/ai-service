@@ -35,7 +35,7 @@ A production-ready, **multi-tenant AI platform** modeled after the OpenAI Consol
               (3 machines)            (min=0, max=20, serverless)
               ┌────────────────┐      ┌──────────────────────────┐
               │ backend  ×4    │      │ ai-backend   (Cloud Run) │
-              │ vllm (GPU) ×2  │      │ ai-vllm GPU  (Cloud Run) │
+              │ llama-cpp ×2   │      │ ai-vllm GPU  (Cloud Run) │
               │ rq-worker ×4   │      └──────────────────────────┘
               │ postgres       │
               │ redis          │        ┌────────────────────────┐
@@ -131,7 +131,7 @@ docker service update \
 | `burst-controller` | — | GCP Cloud Run auto-scaler daemon | Manager |
 | `backend` | 8080 | FastAPI API gateway | Workers ×4 |
 | `worker` | — | RQ document ingestion | Workers ×4 |
-| `vllm` | 8000 | LLM inference (qwen3.5-plus) | GPU Workers ×2 |
+| `llama-cpp` | 8080 | LLM inference (qwen3.5-plus) | GPU Workers ×2 |
 | `frontend` | 3000 | Next.js UI | Workers |
 | `postgres` | 5432 | PostgreSQL + pgvector | Manager |
 | `redis` | 6379 | Rate limit + task queue | Manager |
@@ -253,7 +253,7 @@ cd backend && alembic upgrade head
 |---|---|
 | **Frontend** | Next.js 14, Tailwind CSS, Recharts, next-themes |
 | **Backend** | FastAPI, SQLAlchemy, Alembic, pyjwt, passlib |
-| **LLM Serving** | vLLM (qwen3.5-plus), OpenAI-compatible API |
+| **LLM Serving** | MLX Native (macOS) / llama-cpp (Swarm) |
 | **Hybrid Routing** | Custom FastAPI proxy + Prometheus CPU metrics |
 | **Cloud Burst** | GCP Cloud Run (GPU), gcloud CLI |
 | **Orchestration** | Docker Swarm (local cluster) |
@@ -271,7 +271,6 @@ ai-service/
 ├── backend/                  # FastAPI gateway
 │   ├── routes/               # API route handlers
 │   ├── workers/              # RQ background workers
-│   ├── serve/                # vLLM deployment (legacy, ref only)
 │   ├── models.py             # SQLAlchemy models
 │   └── Dockerfile
 ├── frontend/                 # Next.js 14 dashboard

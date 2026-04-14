@@ -1,6 +1,7 @@
 """RAG management routes: collections + documents"""
 import os
 import uuid
+import logging
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -11,9 +12,11 @@ from models import Collection, Document, DocumentChunk, DocStatus, User
 from auth import get_current_user
 from config import get_settings
 from workers.document_worker import enqueue_document_processing
+from routes.gateway import _build_llm_url
 
 settings = get_settings()
 router = APIRouter(tags=["rag"])
+logger = logging.getLogger(__name__)
 
 
 # ── Collections ────────────────────────────────────────────────────────────
@@ -164,7 +167,14 @@ def get_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    doc = db.query(Document).filter(Document.id == doc_id).first()
+    # Fix [SECURITY]: scope query to team_id to prevent cross-team document access.
+    # Previously: filter only on Document.id — any authenticated user could read any document.
+    doc = (
+        db.query(Document)
+        .join(Collection, Document.collection_id == Collection.id)
+        .filter(Document.id == doc_id, Collection.team_id == current_user.team_id)
+        .first()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     return {
@@ -184,7 +194,14 @@ def delete_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    doc = db.query(Document).filter(Document.id == doc_id).first()
+    # Fix [SECURITY]: scope query to team_id to prevent cross-team document deletion.
+    # Previously: filter only on Document.id — any authenticated user could delete any document.
+    doc = (
+        db.query(Document)
+        .join(Collection, Document.collection_id == Collection.id)
+        .filter(Document.id == doc_id, Collection.team_id == current_user.team_id)
+        .first()
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     col = doc.collection
@@ -214,17 +231,19 @@ async def search_collection(
     start = time.time()
 
     # Get query embedding
+    # Fix: use _build_llm_url() to avoid double /v1 when embedding_base_url already ends with /v1.
+    # Previously: f"{settings.llm_base_url}/v1/embeddings" → '/v1/v1/embeddings' (404).
     embedding = None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
-                f"{settings.vllm_base_url}/v1/embeddings",
+                _build_llm_url(settings.embedding_base_url, "embeddings"),
                 json={"input": query, "model": settings.default_embedding_model},
             )
             result = resp.json()
             embedding = result["data"][0]["embedding"]
-    except Exception:
-        # Fallback: random embedding for dev
+    except Exception as e:
+        logger.warning(f"Embedding API unavailable for search ({e}), using random embedding fallback")
         import random
         embedding = [random.uniform(-0.1, 0.1) for _ in range(1536)]
 

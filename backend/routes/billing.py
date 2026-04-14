@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Subscription, PlanType, User
+from models import Subscription, PlanType, User, UserRole
 from auth import get_current_user
 from datetime import datetime, timezone, timedelta
 
@@ -70,6 +70,10 @@ def upgrade_plan(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # Security: only team owners and admins may change the billing plan.
+    if current_user.role not in (UserRole.owner, UserRole.admin):
+        raise HTTPException(status_code=403, detail="Only team owners or admins can upgrade the plan.")
+
     plan = body.get("plan", "pro")
     if plan not in PLAN_LIMITS:
         raise HTTPException(status_code=400, detail="Invalid plan")
